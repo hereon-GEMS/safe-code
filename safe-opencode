@@ -1,0 +1,285 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+MODE="ro"
+RESUME=""
+PROJECT=""
+PYTHON_ENV=""
+CONFIG="${SAFE_OPENCODE_CONFIG:-${XDG_CONFIG_HOME:-$HOME/.config}/opencode}"
+DATA="${SAFE_OPENCODE_DATA:-${XDG_DATA_HOME:-$HOME/.local/share}/opencode}"
+BWRAP="${SAFE_OPENCODE_BWRAP:-bwrap}"
+CHECK_SERVICE=1
+RO_PATHS=()
+RW_PATHS=()
+
+usage() {
+    cat <<'EOF'
+Usage:
+  safe-opencode [OPTIONS] [PROJECT_DIR] [-- OPENCODE_ARGS...]
+
+Options:
+  --rw                    Mount the project read/write (default: read-only)
+  --mount-ro PATH         Add a read-only host directory at /mnt/host-ro/N
+  --mount-rw PATH         Add a read/write host directory at /mnt/host-rw/N
+  --python-env PATH       Expose a Python environment read-only
+  --config-dir PATH       Use a different host OpenCode config directory
+  --data-dir PATH         Use a different host OpenCode data directory
+  --bwrap PATH            Use a specific Bubblewrap executable
+  --no-service-check      Skip the OpenCode service status check
+  --resume                Continue the most recent session
+  --resume ID             Resume a specific session
+  --help, -h              Show this help
+
+Additional mounts must be existing directories. Their sandbox paths are shown
+before OpenCode starts. Do not mount / or other broad, sensitive directories.
+
+Examples:
+  safe-opencode .
+  safe-opencode --rw .
+  safe-opencode --mount-ro /data/reference --mount-rw /data/output .
+  safe-opencode --python-env "$HOME/.venvs/project" --rw .
+  safe-opencode --rw . -- --help
+EOF
+}
+
+while [[ $# -gt 0 ]]; do
+    case "$1" in
+        --help|-h)
+            usage
+            exit 0
+            ;;
+        --rw)
+            MODE="rw"
+            shift
+            ;;
+        --mount-ro|--mount-rw|--python-env|--config-dir|--data-dir|--bwrap)
+            option="$1"
+            [[ $# -ge 2 && -n "$2" ]] || {
+                echo "Error: $option requires a path" >&2
+                exit 2
+            }
+            case "$option" in
+                --mount-ro) RO_PATHS+=("$2") ;;
+                --mount-rw) RW_PATHS+=("$2") ;;
+                --python-env) PYTHON_ENV="$2" ;;
+                --config-dir) CONFIG="$2" ;;
+                --data-dir) DATA="$2" ;;
+                --bwrap) BWRAP="$2" ;;
+            esac
+            shift 2
+            ;;
+        --no-service-check)
+            CHECK_SERVICE=0
+            shift
+            ;;
+        --resume)
+            if [[ $# -ge 2 && "$2" != -* ]]; then
+                RESUME="$2"
+                shift 2
+            else
+                RESUME="latest"
+                shift
+            fi
+            ;;
+        --)
+            shift
+            break
+            ;;
+        -*)
+            echo "Unknown option: $1" >&2
+            usage >&2
+            exit 2
+            ;;
+        *)
+            PROJECT="$1"
+            shift
+            break
+            ;;
+    esac
+done
+
+PROJECT="$(realpath -e "${PROJECT:-.}")"
+if [[ ! -d "$PROJECT" || "$PROJECT" == "/" ]]; then
+    echo "Error: project must be a directory other than /: $PROJECT" >&2
+    exit 1
+fi
+
+for i in "${!RO_PATHS[@]}"; do
+    RO_PATHS[$i]="$(realpath -e "${RO_PATHS[$i]}")"
+    if [[ ! -d "${RO_PATHS[$i]}" || "${RO_PATHS[$i]}" == "/" ]]; then
+        echo "Error: read-only mount must be a directory other than /: ${RO_PATHS[$i]}" >&2
+        exit 1
+    fi
+done
+
+for i in "${!RW_PATHS[@]}"; do
+    RW_PATHS[$i]="$(realpath -e "${RW_PATHS[$i]}")"
+    if [[ ! -d "${RW_PATHS[$i]}" || "${RW_PATHS[$i]}" == "/" ]]; then
+        echo "Error: read/write mount must be a directory other than /: ${RW_PATHS[$i]}" >&2
+        exit 1
+    fi
+done
+
+if [[ -n "$PYTHON_ENV" ]]; then
+    PYTHON_ENV="$(realpath -e "$PYTHON_ENV")"
+    if [[ ! -d "$PYTHON_ENV" || ! -x "$PYTHON_ENV/bin/python" ]]; then
+        echo "Error: Python environment must contain an executable bin/python: $PYTHON_ENV" >&2
+        exit 1
+    fi
+fi
+
+OPENCODE="$(command -v opencode || true)"
+if [[ -z "$OPENCODE" ]]; then
+    echo "Error: opencode not found in PATH" >&2
+    exit 1
+fi
+OPENCODE="$(readlink -f "$OPENCODE")"
+OPENCODE_DIR="$(dirname "$OPENCODE")"
+OPENCODE_NAME="$(basename "$OPENCODE")"
+
+if ! command -v "$BWRAP" >/dev/null 2>&1; then
+    echo "Error: Bubblewrap executable not found: $BWRAP" >&2
+    exit 1
+fi
+BWRAP="$(command -v "$BWRAP")"
+
+CONFIG="$(realpath -m "$CONFIG")"
+DATA="$(realpath -m "$DATA")"
+mkdir -p "$CONFIG" "$DATA"
+
+if [[ "$CHECK_SERVICE" == 1 ]]; then
+    if SERVICE_STATUS="$("$OPENCODE" service status 2>&1)"; then
+        printf 'OpenCode service status: %s\n' "${SERVICE_STATUS:-available}"
+    else
+        printf 'OpenCode service status unavailable: %s\n' "${SERVICE_STATUS:-no status returned}" >&2
+    fi
+fi
+
+ARGS=(
+    --die-with-parent
+    --new-session
+    --ro-bind /usr /usr
+    --ro-bind /bin /bin
+    --proc /proc
+    --dev /dev
+    --tmpfs /tmp
+    --dir /tmp/home
+    --dir /tmp/cache
+    --dir /etc
+)
+
+for d in /lib /lib64; do
+    if [[ -e "$d" ]]; then
+        ARGS+=(--ro-bind "$d" "$d")
+    fi
+done
+
+for f in /etc/hosts /etc/resolv.conf /etc/nsswitch.conf; do
+    if [[ -e "$f" ]]; then
+        ARGS+=(--ro-bind "$(readlink -f "$f")" "$f")
+    fi
+done
+
+for d in /etc/pki /etc/ssl; do
+    if [[ -d "$d" ]]; then
+        ARGS+=(--ro-bind "$d" "$d")
+    fi
+done
+
+ARGS+=(--dir /workspace)
+if [[ "$MODE" == "rw" ]]; then
+    ARGS+=(--bind "$PROJECT" /workspace)
+else
+    ARGS+=(--ro-bind "$PROJECT" /workspace)
+fi
+
+ARGS+=(
+    --dir /sandbox-config
+    --ro-bind "$CONFIG" /sandbox-config/opencode
+    --dir /sandbox-data
+    --bind "$DATA" /sandbox-data/opencode
+    --dir /opt
+    --ro-bind "$OPENCODE_DIR" /opt/opencode-bin
+    --dir /mnt
+    --dir /mnt/host-ro
+    --dir /mnt/host-rw
+)
+
+ensure_parent_dirs() {
+    local path="$1"
+    local parent
+    local component
+    local current=""
+    local -a components=()
+
+    parent="$(dirname "$path")"
+    IFS='/' read -r -a components <<< "$parent"
+    for component in "${components[@]}"; do
+        [[ -n "$component" ]] || continue
+        current+="/$component"
+        ARGS+=(--dir "$current")
+    done
+}
+
+for i in "${!RO_PATHS[@]}"; do
+    target="/mnt/host-ro/$((i + 1))"
+    ARGS+=(--dir "$target" --ro-bind "${RO_PATHS[$i]}" "$target")
+done
+
+for i in "${!RW_PATHS[@]}"; do
+    target="/mnt/host-rw/$((i + 1))"
+    ARGS+=(--dir "$target" --bind "${RW_PATHS[$i]}" "$target")
+done
+
+PATH_VALUE="/opt/opencode-bin:/usr/local/bin:/usr/bin:/bin"
+if [[ -n "$PYTHON_ENV" ]]; then
+    ensure_parent_dirs "$PYTHON_ENV"
+    ARGS+=(--ro-bind "$PYTHON_ENV" "$PYTHON_ENV")
+    PATH_VALUE="$PYTHON_ENV/bin:$PATH_VALUE"
+    ARGS+=(--setenv VIRTUAL_ENV "$PYTHON_ENV")
+fi
+
+ARGS+=(
+    --setenv HOME /tmp/home
+    --setenv XDG_CONFIG_HOME /sandbox-config
+    --setenv XDG_DATA_HOME /sandbox-data
+    --setenv XDG_CACHE_HOME /tmp/cache
+    --setenv TMPDIR /tmp
+    --setenv PATH "$PATH_VALUE"
+    --chdir /workspace
+)
+
+OC_ARGS=()
+if [[ "$RESUME" == "latest" ]]; then
+    OC_ARGS+=(--continue)
+elif [[ -n "$RESUME" ]]; then
+    OC_ARGS+=(--session "$RESUME")
+fi
+OC_ARGS+=("$@")
+
+echo "Project: $PROJECT ($MODE)"
+for i in "${!RO_PATHS[@]}"; do
+    printf 'Read-only mount: %s -> /mnt/host-ro/%s\n' "${RO_PATHS[$i]}" "$((i + 1))"
+done
+for i in "${!RW_PATHS[@]}"; do
+    printf 'Read/write mount: %s -> /mnt/host-rw/%s\n' "${RW_PATHS[$i]}" "$((i + 1))"
+done
+if [[ -n "$PYTHON_ENV" ]]; then
+    echo "Python environment: $PYTHON_ENV (read-only)"
+fi
+echo "Resume: ${RESUME:-new session}"
+echo "Environment context (paste into your opening prompt if useful):"
+echo "Use only the files and paths available in this sandbox. The project is /workspace ($MODE)."
+for i in "${!RO_PATHS[@]}"; do
+    echo "Host reference directory /mnt/host-ro/$((i + 1)) is read-only."
+done
+for i in "${!RW_PATHS[@]}"; do
+    echo "Host output directory /mnt/host-rw/$((i + 1)) is writable; keep changes there unless asked otherwise."
+done
+if [[ -n "$PYTHON_ENV" ]]; then
+    echo "Python is available from the read-only environment at $PYTHON_ENV/bin/python."
+fi
+
+exec "$BWRAP" "${ARGS[@]}" \
+    "/opt/opencode-bin/$OPENCODE_NAME" \
+    "${OC_ARGS[@]}"
