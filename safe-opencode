@@ -195,7 +195,7 @@ fi
 
 ARGS+=(
     --dir /sandbox-config
-    --ro-bind "$CONFIG" /sandbox-config/opencode
+    --bind "$CONFIG" /sandbox-config/opencode
     --dir /sandbox-data
     --bind "$DATA" /sandbox-data/opencode
     --dir /opt
