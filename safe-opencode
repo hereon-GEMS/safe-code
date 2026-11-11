@@ -9,8 +9,14 @@ CONFIG="${SAFE_OPENCODE_CONFIG:-${XDG_CONFIG_HOME:-$HOME/.config}/opencode}"
 DATA="${SAFE_OPENCODE_DATA:-${XDG_DATA_HOME:-$HOME/.local/share}/opencode}"
 BWRAP="${SAFE_OPENCODE_BWRAP:-bwrap}"
 CHECK_SERVICE=1
+#Exposed host paths to mount in the sandbox
 RO_PATHS=()
 RW_PATHS=()
+#Target mount points in the sandbox
+RO_TARGETS=()
+RW_TARGETS=()
+EXTRA_PATHS=()
+LIBRARY_PATHS=()
 
 usage() {
     cat <<'EOF'
@@ -19,8 +25,10 @@ Usage:
 
 Options:
   --rw                    Mount the project read/write (default: read-only)
-  --mount-ro PATH         Add a read-only host directory at /mnt/host-ro/N
-  --mount-rw PATH         Add a read/write host directory at /mnt/host-rw/N
+  --mount-ro HOST_PATH[=SANDBOX_PATH] Add a read-only host directory at SANDBOX_PATH (default: /mnt/host-ro/N)
+  --mount-rw HOST_PATH[=SANDBOX_PATH] Add a read/write host directory at SANDBOX_PATH (default: /mnt/host-rw/N)
+  --path PATH             Prepend a sandbox directory to PATH
+  --library-path PATH     Prepend a sandbox directory to LD_LIBRARY_PATH
   --python-env PATH       Expose a Python environment read-only
   --config-dir PATH       Use a different host OpenCode config directory
   --data-dir PATH         Use a different host OpenCode data directory
@@ -30,14 +38,19 @@ Options:
   --resume ID             Resume a specific session
   --help, -h              Show this help
 
-Additional mounts must be existing directories. Their sandbox paths are shown
-before OpenCode starts. Do not mount / or other broad, sensitive directories.
+Mount sources must be existing directories. Without DEST, mounts use numbered
+paths under /mnt/host-ro or /mnt/host-rw. DEST must be an absolute sandbox
+directory other than /. Named destinations cannot replace built-in sandbox
+mounts. Do not mount / or other broad, sensitive directories.
+Note that --standalone provides isolation of the server, opencode creates a new session, and the sandbox is destroyed when the session ends.
+Without --standalone, if there is running OpenCode service, the sandbox will connect to it and use its session which may not be isolated from the host. Use --standalone to ensure isolation.
 
 Examples:
-  safe-opencode .
-  safe-opencode --rw .
-  safe-opencode --mount-ro /data/reference --mount-rw /data/output .
-  safe-opencode --python-env "$HOME/.venvs/project" --rw .
+  safe-opencode . -- --standalone
+  safe-opencode --rw . -- --standalone
+  safe-opencode --mount-ro /data/reference --mount-rw /data/output . -- --standalone
+  safe-opencode --mount-ro /opt/vendor/lib=/opt/vendor/lib --library-path /opt/vendor/lib . -- --standalone
+  safe-opencode --python-env "$HOME/.venvs/project" --rw . -- --standalone
   safe-opencode --rw . -- --help
 EOF
 }
@@ -52,19 +65,29 @@ while [[ $# -gt 0 ]]; do
             MODE="rw"
             shift
             ;;
-        --mount-ro|--mount-rw|--python-env|--config-dir|--data-dir|--bwrap)
+        --mount-ro|--mount-rw|--python-env|--config-dir|--data-dir|--bwrap|--path|--library-path)
             option="$1"
             [[ $# -ge 2 && -n "$2" ]] || {
                 echo "Error: $option requires a path" >&2
                 exit 2
             }
             case "$option" in
-                --mount-ro) RO_PATHS+=("$2") ;;
-                --mount-rw) RW_PATHS+=("$2") ;;
+                --mount-ro)
+                    read_mount_spec "$2"
+                    RO_PATHS+=("$MOUNT_SOURCE")
+                    RO_TARGETS+=("$MOUNT_TARGET")
+                    ;;
+                --mount-rw)
+                    read_mount_spec "$2"
+                    RW_PATHS+=("$MOUNT_SOURCE")
+                    RW_TARGETS+=("$MOUNT_TARGET")
+                    ;;
                 --python-env) PYTHON_ENV="$2" ;;
                 --config-dir) CONFIG="$2" ;;
                 --data-dir) DATA="$2" ;;
                 --bwrap) BWRAP="$2" ;;
+                --path) EXTRA_PATHS+=("$2") ;;
+                --library-path) LIBRARY_PATHS+=("$2") ;;
             esac
             shift 2
             ;;
@@ -110,6 +133,9 @@ for i in "${!RO_PATHS[@]}"; do
         echo "Error: read-only mount must be a directory other than /: ${RO_PATHS[$i]}" >&2
         exit 1
     fi
+    if [[ -n "${RO_TARGETS[$i]}" ]]; then
+        RO_TARGETS[$i]="$(realpath -m "${RO_TARGETS[$i]}")"
+    fi
 done
 
 for i in "${!RW_PATHS[@]}"; do
@@ -117,6 +143,39 @@ for i in "${!RW_PATHS[@]}"; do
     if [[ ! -d "${RW_PATHS[$i]}" || "${RW_PATHS[$i]}" == "/" ]]; then
         echo "Error: read/write mount must be a directory other than /: ${RW_PATHS[$i]}" >&2
         exit 1
+    fi
+    if [[ -n "${RW_TARGETS[$i]}" ]]; then
+        RW_TARGETS[$i]="$(realpath -m "${RW_TARGETS[$i]}")"
+    fi
+done
+
+RESERVED_MOUNTS=(/usr /bin /lib /lib64 /etc/hosts /etc/resolv.conf /etc/nsswitch.conf /etc/pki /etc/ssl /tmp /dev /proc /workspace /sandbox-config /sandbox-data /opt/opencode-bin /mnt/host-ro /mnt/host-rw)
+NAMED_TARGETS=()
+for target in "${RO_TARGETS[@]}" "${RW_TARGETS[@]}"; do
+    [[ -n "$target" ]] || continue
+    if [[ "$target" == "/" ]]; then
+        echo "Error: named mount destination must not be /" >&2
+        exit 1
+    fi
+    for reserved in "${RESERVED_MOUNTS[@]}"; do
+        if [[ "$target" == "$reserved" || "$target" == "$reserved/"* || "$reserved" == "$target/"* ]]; then
+            printf 'Error: named mount destination conflicts with built-in sandbox path %s: %s\n' "$reserved" "$target" >&2
+            exit 1
+        fi
+    done
+    for existing in "${NAMED_TARGETS[@]}"; do
+        if [[ "$target" == "$existing" ]]; then
+            printf 'Error: duplicate named mount destination: %s\n' "$target" >&2
+            exit 1
+        fi
+    done
+    NAMED_TARGETS+=("$target")
+done
+
+for path in "${EXTRA_PATHS[@]}" "${LIBRARY_PATHS[@]}"; do
+    if [[ "$path" != /* || "$path" == *:* ]]; then
+        printf 'Error: PATH entries must be absolute sandbox paths without colons: %s\n' "$path" >&2
+        exit 2
     fi
 done
 
@@ -150,6 +209,25 @@ mkdir -p "$CONFIG" "$DATA"
 if [[ "$CHECK_SERVICE" == 1 ]]; then
     if SERVICE_STATUS="$("$OPENCODE" service status 2>&1)"; then
         printf 'OpenCode service status: %s\n' "${SERVICE_STATUS:-available}"
+        if [[ "$SERVICE_STATUS" != "stopped" ]]; then
+            printf 'An OpenCode background service is running outside the sandbox. Stop it before continuing? [y/N] ' >&2
+            if ! IFS= read -r reply || [[ ! "$reply" =~ ^[Yy]([Ee][Ss])?$ ]]; then
+                echo "Aborted: the host OpenCode service was not stopped." >&2
+                exit 1
+            fi
+            if ! "$OPENCODE" service stop; then
+                echo "Error: failed to stop the host OpenCode service." >&2
+                exit 1
+            fi
+            if ! SERVICE_STATUS="$("$OPENCODE" service status 2>&1)"; then
+                printf 'Error: could not verify the host OpenCode service stopped: %s\n' "$SERVICE_STATUS" >&2
+                exit 1
+            fi
+            if [[ "$SERVICE_STATUS" != "stopped" ]]; then
+                printf 'Error: host OpenCode service is not stopped: %s\n' "$SERVICE_STATUS" >&2
+                exit 1
+            fi
+        fi
     else
         printf 'OpenCode service status unavailable: %s\n' "${SERVICE_STATUS:-no status returned}" >&2
     fi
@@ -192,6 +270,7 @@ if [[ "$MODE" == "rw" ]]; then
 else
     ARGS+=(--ro-bind "$PROJECT" /workspace)
 fi
+# For read/write:
 
 ARGS+=(
     --dir /sandbox-config
@@ -204,11 +283,13 @@ ARGS+=(
     --dir /mnt/host-ro
     --dir /mnt/host-rw
 )
+DIRS_ADDED=(/tmp /tmp/home /tmp/cache /etc /workspace /sandbox-config /sandbox-data /opt /mnt /mnt/host-ro /mnt/host-rw)
 
 ensure_parent_dirs() {
     local path="$1"
     local parent
     local component
+    local known
     local current=""
     local -a components=()
 
@@ -217,26 +298,57 @@ ensure_parent_dirs() {
     for component in "${components[@]}"; do
         [[ -n "$component" ]] || continue
         current+="/$component"
+        for known in "${DIRS_ADDED[@]}"; do
+            [[ "$current" == "$known" ]] && continue 2
+        done
         ARGS+=(--dir "$current")
+        DIRS_ADDED+=("$current")
     done
 }
 
 for i in "${!RO_PATHS[@]}"; do
-    target="/mnt/host-ro/$((i + 1))"
+    target="${RO_TARGETS[$i]}"
+    if [[ -z "$target" ]]; then
+        target="/mnt/host-ro/$((i + 1))"
+    else
+        ensure_parent_dirs "$target"
+    fi
     ARGS+=(--dir "$target" --ro-bind "${RO_PATHS[$i]}" "$target")
+    DIRS_ADDED+=("$target")
 done
 
 for i in "${!RW_PATHS[@]}"; do
-    target="/mnt/host-rw/$((i + 1))"
+    target="${RW_TARGETS[$i]}"
+    if [[ -z "$target" ]]; then
+        target="/mnt/host-rw/$((i + 1))"
+    else
+        ensure_parent_dirs "$target"
+    fi
     ARGS+=(--dir "$target" --bind "${RW_PATHS[$i]}" "$target")
+    DIRS_ADDED+=("$target")
 done
 
 PATH_VALUE="/opt/opencode-bin:/usr/local/bin:/usr/bin:/bin"
+EXTRA_PATH_VALUE=""
+for path in "${EXTRA_PATHS[@]}"; do
+    EXTRA_PATH_VALUE="${EXTRA_PATH_VALUE:+$EXTRA_PATH_VALUE:}$path"
+done
+if [[ -n "$EXTRA_PATH_VALUE" ]]; then
+    PATH_VALUE="$EXTRA_PATH_VALUE:$PATH_VALUE"
+fi
 if [[ -n "$PYTHON_ENV" ]]; then
     ensure_parent_dirs "$PYTHON_ENV"
     ARGS+=(--ro-bind "$PYTHON_ENV" "$PYTHON_ENV")
     PATH_VALUE="$PYTHON_ENV/bin:$PATH_VALUE"
     ARGS+=(--setenv VIRTUAL_ENV "$PYTHON_ENV")
+fi
+
+if [[ "${#LIBRARY_PATHS[@]}" -gt 0 ]]; then
+    LIBRARY_PATH_VALUE=""
+    for path in "${LIBRARY_PATHS[@]}"; do
+        LIBRARY_PATH_VALUE="${LIBRARY_PATH_VALUE:+$LIBRARY_PATH_VALUE:}$path"
+    done
+    ARGS+=(--setenv LD_LIBRARY_PATH "$LIBRARY_PATH_VALUE")
 fi
 
 ARGS+=(
@@ -257,28 +369,71 @@ elif [[ -n "$RESUME" ]]; then
 fi
 OC_ARGS+=("$@")
 
+STANDALONE=0
+for arg in "${OC_ARGS[@]}"; do
+    if [[ "$arg" == "--standalone" ]]; then
+        STANDALONE=1
+        break
+    fi
+done
+if [[ "$STANDALONE" == 0 ]]; then
+    cat >&2 <<'EOF'
+WARNING: OpenCode is not being started with --standalone.
+It may connect to or start a background service outside this sandbox, which can
+bypass Bubblewrap filesystem isolation. Add "-- --standalone" to keep the
+OpenCode server inside the sandbox.
+EOF
+fi
+
 echo "Project: $PROJECT ($MODE)"
 for i in "${!RO_PATHS[@]}"; do
-    printf 'Read-only mount: %s -> /mnt/host-ro/%s\n' "${RO_PATHS[$i]}" "$((i + 1))"
+    target="${RO_TARGETS[$i]:-/mnt/host-ro/$((i + 1))}"
+    printf 'Read-only mount: %s -> %s\n' "${RO_PATHS[$i]}" "$target"
 done
 for i in "${!RW_PATHS[@]}"; do
-    printf 'Read/write mount: %s -> /mnt/host-rw/%s\n' "${RW_PATHS[$i]}" "$((i + 1))"
+    target="${RW_TARGETS[$i]:-/mnt/host-rw/$((i + 1))}"
+    printf 'Read/write mount: %s -> %s\n' "${RW_PATHS[$i]}" "$target"
+done
+for path in "${EXTRA_PATHS[@]}"; do
+    printf 'PATH entry: %s\n' "$path"
+done
+for path in "${LIBRARY_PATHS[@]}"; do
+    printf 'Library path: %s\n' "$path"
 done
 if [[ -n "$PYTHON_ENV" ]]; then
     echo "Python environment: $PYTHON_ENV (read-only)"
 fi
 echo "Resume: ${RESUME:-new session}"
-echo "Environment context (paste into your opening prompt if useful):"
-echo "Use only the files and paths available in this sandbox. The project is /workspace ($MODE)."
-for i in "${!RO_PATHS[@]}"; do
-    echo "Host reference directory /mnt/host-ro/$((i + 1)) is read-only."
-done
-for i in "${!RW_PATHS[@]}"; do
-    echo "Host output directory /mnt/host-rw/$((i + 1)) is writable; keep changes there unless asked otherwise."
-done
-if [[ -n "$PYTHON_ENV" ]]; then
-    echo "Python is available from the read-only environment at $PYTHON_ENV/bin/python."
-fi
+
+echo "Environment context to be passed to OpenCode, saved to $PROJECT/PROMPT_CONTEXT:"
+PROMPT_CONTEXT="$PROJECT/PROMPT_CONTEXT"
+{
+    printf 'Sandbox start time: %s\n' "$(date --iso-8601=seconds)"
+    echo "Use only the files and paths available in this sandbox. The project is /workspace ($MODE)."
+
+    for i in "${!RO_PATHS[@]}"; do
+        target="${RO_TARGETS[$i]:-/mnt/host-ro/$((i + 1))}"
+        echo "Host reference directory $target is read-only."
+    done
+
+    for i in "${!RW_PATHS[@]}"; do
+        target="${RW_TARGETS[$i]:-/mnt/host-rw/$((i + 1))}"
+        echo "Host output directory $target is writable; keep changes there unless asked otherwise."
+    done
+
+    if [[ -n "$PYTHON_ENV" ]]; then
+        echo "Python is available from the read-only environment at $PYTHON_ENV/bin/python."
+    fi
+
+    for path in "${EXTRA_PATHS[@]}"; do
+        echo "Executable directory available at $path."
+    done
+
+    for path in "${LIBRARY_PATHS[@]}"; do
+        echo "Shared libraries are available from $path."
+    done
+} | tee "$PROMPT_CONTEXT"
+
 
 exec "$BWRAP" "${ARGS[@]}" \
     "/opt/opencode-bin/$OPENCODE_NAME" \
