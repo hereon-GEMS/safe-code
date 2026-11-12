@@ -17,6 +17,7 @@ RO_TARGETS=()
 RW_TARGETS=()
 EXTRA_PATHS=()
 LIBRARY_PATHS=()
+DRY_RUN=0
 
 usage() {
     cat <<'EOF'
@@ -36,6 +37,7 @@ Options:
   --no-service-check      Skip the OpenCode service status check
   --resume                Continue the most recent session
   --resume ID             Resume a specific session
+  --dry-run               Open an interactive shell in the sandbox without starting OpenCode
   --help, -h              Show this help
 
 Mount sources must be existing directories. Without DEST, mounts use numbered
@@ -53,6 +55,22 @@ Examples:
   safe-opencode --python-env "$HOME/.venvs/project" --rw . -- --standalone
   safe-opencode --rw . -- --help
 EOF
+}
+
+read_mount_spec() {
+    local spec="$1"
+    MOUNT_SOURCE="$spec"
+    MOUNT_TARGET=""
+
+    if [[ "$spec" == *=* ]]; then
+        MOUNT_SOURCE="${spec%%=*}"
+        MOUNT_TARGET="${spec#*=}"
+
+        if [[ -z "$MOUNT_SOURCE" || -z "$MOUNT_TARGET" || "$MOUNT_TARGET" != /* ]]; then
+            echo "Error: named mount must be HOST_PATH=/absolute/sandbox/path: $spec" >&2
+            exit 2
+        fi
+    fi
 }
 
 while [[ $# -gt 0 ]]; do
@@ -104,6 +122,10 @@ while [[ $# -gt 0 ]]; do
                 shift
             fi
             ;;
+	--dry-run)
+	    DRY_RUN=1
+	    shift
+	    ;;
         --)
             shift
             break
@@ -120,6 +142,11 @@ while [[ $# -gt 0 ]]; do
             ;;
     esac
 done
+
+# Remove the separator after PROJECT_DIR before forwarding OpenCode arguments.
+if [[ "${1:-}" == "--" ]]; then
+    shift
+fi
 
 PROJECT="$(realpath -e "${PROJECT:-.}")"
 if [[ ! -d "$PROJECT" || "$PROJECT" == "/" ]]; then
@@ -206,7 +233,7 @@ CONFIG="$(realpath -m "$CONFIG")"
 DATA="$(realpath -m "$DATA")"
 mkdir -p "$CONFIG" "$DATA"
 
-if [[ "$CHECK_SERVICE" == 1 ]]; then
+if [[ "$CHECK_SERVICE" == 1 && "$DRY_RUN" == 0 ]]; then
     if SERVICE_STATUS="$("$OPENCODE" service status 2>&1)"; then
         printf 'OpenCode service status: %s\n' "${SERVICE_STATUS:-available}"
         if [[ "$SERVICE_STATUS" != "stopped" ]]; then
@@ -376,7 +403,7 @@ for arg in "${OC_ARGS[@]}"; do
         break
     fi
 done
-if [[ "$STANDALONE" == 0 ]]; then
+if [[ "$STANDALONE" == 0 && "$DRY_RUN" == 0 ]]; then
     cat >&2 <<'EOF'
 WARNING: OpenCode is not being started with --standalone.
 It may connect to or start a background service outside this sandbox, which can
@@ -405,9 +432,7 @@ if [[ -n "$PYTHON_ENV" ]]; then
 fi
 echo "Resume: ${RESUME:-new session}"
 
-echo "Environment context to be passed to OpenCode, saved to $PROJECT/PROMPT_CONTEXT:"
-PROMPT_CONTEXT="$PROJECT/PROMPT_CONTEXT"
-{
+print_prompt_context() {
     printf 'Sandbox start time: %s\n' "$(date --iso-8601=seconds)"
     echo "Use only the files and paths available in this sandbox. The project is /workspace ($MODE)."
 
@@ -432,9 +457,24 @@ PROMPT_CONTEXT="$PROJECT/PROMPT_CONTEXT"
     for path in "${LIBRARY_PATHS[@]}"; do
         echo "Shared libraries are available from $path."
     done
-} | tee "$PROMPT_CONTEXT"
+}
+
+if [[ "$DRY_RUN" == 1 ]]; then
+    echo "Environment context:"
+    print_prompt_context
+else
+    echo "Environment context to be passed to OpenCode, saved to $PROJECT/PROMPT_CONTEXT:"
+    PROMPT_CONTEXT="$PROJECT/PROMPT_CONTEXT"
+    print_prompt_context | tee "$PROMPT_CONTEXT"
+fi
 
 
-exec "$BWRAP" "${ARGS[@]}" \
-    "/opt/opencode-bin/$OPENCODE_NAME" \
-    "${OC_ARGS[@]}"
+if [[ "$DRY_RUN" == 1 ]]; then
+    echo "Dry run: starting an interactive shell in the sandbox without starting OpenCode."
+    exec "$BWRAP" "${ARGS[@]}" /bin/bash --noprofile --norc -i
+else
+    echo "Starting OpenCode in the sandbox..."
+	exec "$BWRAP" "${ARGS[@]}" \
+    	"/opt/opencode-bin/$OPENCODE_NAME" \
+    	"${OC_ARGS[@]}"
+fi
